@@ -1,9 +1,10 @@
 # Output directories
 *_plex_m3u_exports/
 
-# Plex XML exports (may contain personal library paths)
+# Plex XML exports and env (may contain personal library paths / tokens)
 *.xml
 !*.sample.xml
+.env
 
 # Python
 __pycache__/
