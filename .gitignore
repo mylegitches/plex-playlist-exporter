@@ -1,0 +1,18 @@
+# Output directories
+*_plex_m3u_exports/
+
+# Plex XML exports (may contain personal library paths)
+*.xml
+!*.sample.xml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
