@@ -243,12 +243,62 @@ def run_ssh(ssh_target: str, cmd: str, timeout: int = 60):
     return result.stdout
 
 
+def find_log_dir_local():
+    """Return the Plex Logs directory on this machine, or None."""
+    # 1. Try every known static path first
+    for candidate in DEFAULT_LOG_PATHS:
+        p = Path(candidate)
+        if p.is_dir() and any(p.glob("Plex Media Server.log*")):
+            return str(p)
+
+    # 2. Broad search: look for the canonical log file under common roots
+    print("  Known paths not found — searching broadly for 'Plex Media Server.log' ...")
+    search_roots = []
+    if sys.platform == "win32":
+        import string
+        for letter in string.ascii_uppercase:
+            r = Path(f"{letter}:/")
+            if r.exists():
+                search_roots.append(r)
+    else:
+        for r in ["/", "/home", "/opt", "/mnt", "/media", "/volume1", "/volume2"]:
+            if Path(r).exists():
+                search_roots.append(Path(r))
+
+    for root in search_roots:
+        try:
+            for match in root.rglob("Plex Media Server.log"):
+                return str(match.parent)
+        except (PermissionError, OSError):
+            continue
+
+    return None
+
+
 def find_log_dir_ssh(ssh_target: str):
-    """Try default paths on the remote host; return the first that exists."""
+    """Try default paths on the remote host, then do a broad find. Returns path or None."""
+    # 1. Try known static paths
     for path in DEFAULT_LOG_PATHS:
-        out = run_ssh(ssh_target, f'test -d "{path}" && echo yes || echo no')
+        out = run_ssh(ssh_target, f'test -f "{path}/Plex Media Server.log" && echo yes || echo no')
         if out.strip() == "yes":
             return path
+
+    # 2. Broad search via find — check common roots
+    print("  Known paths not found — searching broadly on remote host ...")
+    cmd = (
+        'find /var /opt /home /mnt /volume1 /volume2 /usr /srv / '
+        r'-maxdepth 12 -name "Plex Media Server.log" 2>/dev/null '
+        '| head -1'
+    )
+    try:
+        out = run_ssh(ssh_target, cmd, timeout=90)
+        hit = out.strip()
+        if hit:
+            # strip the filename to get the directory
+            return hit.rsplit("/", 1)[0]
+    except (RuntimeError, subprocess.TimeoutExpired):
+        pass
+
     return None
 
 
@@ -426,19 +476,16 @@ def main():
     ssh = args.ssh.strip()
     log_dir = args.log_dir.strip()
 
-    # --- Determine log directory ---
+    # --- Determine log directory and scan ---
     if ssh:
         if not log_dir:
             print("Detecting Plex log directory on remote host...")
             log_dir = find_log_dir_ssh(ssh)
             if not log_dir:
                 print("ERROR: Could not find Plex log directory on remote host.")
-                print("Tried:")
-                for p in DEFAULT_LOG_PATHS:
-                    print(f"  {p}")
-                print("Specify it explicitly with --log-dir")
+                print("Specify it explicitly with --log-dir PATH")
                 sys.exit(1)
-        print(f"Log directory: {log_dir}")
+        print(f"Log directory (remote): {log_dir}")
         print("Listing log files...")
         remote_files = list_log_files_ssh(ssh, log_dir)
         if not remote_files:
@@ -457,26 +504,22 @@ def main():
             scanned.append(short)
     else:
         if not log_dir:
-            # Try local defaults
-            for candidate in DEFAULT_LOG_PATHS:
-                if Path(candidate).is_dir():
-                    log_dir = candidate
-                    break
+            print("Detecting Plex log directory locally...")
+            log_dir = find_log_dir_local()
         if not log_dir or not Path(log_dir).is_dir():
             print("ERROR: Cannot find Plex log directory locally.")
-            print("Specify --log-dir PATH or --ssh USER@HOST")
+            print("Specify --log-dir PATH or use --ssh USER@HOST for a remote server.")
             sys.exit(1)
         log_path = Path(log_dir)
-        print(f"Log directory: {log_dir}")
-        local_files = sorted(log_path.rglob("*.log")) + sorted(log_path.rglob("*.log.*"))
-        # De-duplicate while preserving order
-        seen = set()
-        local_files_dedup = []
-        for f in local_files:
+        print(f"Log directory (local): {log_dir}")
+        # Collect all .log and rotated log files, de-duplicated
+        all_files = sorted(log_path.rglob("*.log")) + sorted(log_path.rglob("*.log.*"))
+        seen: set = set()
+        local_files = []
+        for f in all_files:
             if f not in seen:
                 seen.add(f)
-                local_files_dedup.append(f)
-        local_files = local_files_dedup
+                local_files.append(f)
         if not local_files:
             print(f"ERROR: No log files found in {log_dir}")
             sys.exit(1)
