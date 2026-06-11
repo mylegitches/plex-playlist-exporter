@@ -39,15 +39,33 @@ OUTPUT_FILE = "plex_deletion_report.txt"
 
 # Common Plex log directory paths (tried in order when --log-dir is not given)
 DEFAULT_LOG_PATHS = [
+    # Linux package installs
     "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Logs",
     "/usr/lib/plexmediaserver/Library/Application Support/Plex Media Server/Logs",
     "/opt/plexmediaserver/Library/Application Support/Plex Media Server/Logs",
-    "/volume1/Plex/Library/Application Support/Plex Media Server/Logs",   # Synology
+    # Synology NAS
+    "/volume1/Plex/Library/Application Support/Plex Media Server/Logs",
     "/volume1/PlexMediaServer/Library/Application Support/Plex Media Server/Logs",
-    "/mnt/user/appdata/plex/Library/Application Support/Plex Media Server/Logs",  # Unraid
-    r"C:\Users\plex\AppData\Local\Plex Media Server\Logs",  # Windows server
+    # Unraid
+    "/mnt/user/appdata/plex/Library/Application Support/Plex Media Server/Logs",
+    # Windows — ProgramData (service installs)
     r"C:\ProgramData\Plex Media Server\Logs",
 ]
+
+# Windows-specific: build paths for every user profile under C:\Users and other drives
+def _windows_user_log_paths():
+    import string
+    paths = []
+    for letter in string.ascii_uppercase:
+        users = Path(f"{letter}:/Users")
+        if users.is_dir():
+            try:
+                for profile in users.iterdir():
+                    candidate = profile / "AppData" / "Local" / "Plex Media Server" / "Logs"
+                    paths.append(str(candidate))
+            except (PermissionError, OSError):
+                pass
+    return paths
 
 # Log files to scan within the log directory
 LOG_FILENAME_PATTERNS = [
@@ -243,27 +261,31 @@ def run_ssh(ssh_target: str, cmd: str, timeout: int = 60):
     return result.stdout
 
 
+def _has_plex_log(directory: Path) -> bool:
+    return directory.is_dir() and any(directory.glob("Plex Media Server.log*"))
+
+
 def find_log_dir_local():
     """Return the Plex Logs directory on this machine, or None."""
-    # 1. Try every known static path first
-    for candidate in DEFAULT_LOG_PATHS:
+    # 1. Static known paths (Linux/NAS/Windows service)
+    all_candidates = list(DEFAULT_LOG_PATHS)
+
+    # 2. Windows: add every user profile on every drive
+    if sys.platform == "win32":
+        all_candidates.extend(_windows_user_log_paths())
+
+    for candidate in all_candidates:
         p = Path(candidate)
-        if p.is_dir() and any(p.glob("Plex Media Server.log*")):
+        if _has_plex_log(p):
             return str(p)
 
-    # 2. Broad search: look for the canonical log file under common roots
+    # 3. Broad fallback: rglob for the log file across all drives/mounts
     print("  Known paths not found — searching broadly for 'Plex Media Server.log' ...")
-    search_roots = []
     if sys.platform == "win32":
         import string
-        for letter in string.ascii_uppercase:
-            r = Path(f"{letter}:/")
-            if r.exists():
-                search_roots.append(r)
+        search_roots = [Path(f"{l}:/") for l in string.ascii_uppercase if Path(f"{l}:/").exists()]
     else:
-        for r in ["/", "/home", "/opt", "/mnt", "/media", "/volume1", "/volume2"]:
-            if Path(r).exists():
-                search_roots.append(Path(r))
+        search_roots = [Path(r) for r in ["/", "/home", "/opt", "/mnt", "/media", "/volume1", "/volume2"] if Path(r).exists()]
 
     for root in search_roots:
         try:
@@ -276,25 +298,44 @@ def find_log_dir_local():
 
 
 def find_log_dir_ssh(ssh_target: str):
-    """Try default paths on the remote host, then do a broad find. Returns path or None."""
-    # 1. Try known static paths
-    for path in DEFAULT_LOG_PATHS:
-        out = run_ssh(ssh_target, f'test -f "{path}/Plex Media Server.log" && echo yes || echo no')
+    """Try default paths on the remote host (Linux and Windows), then broad find. Returns path or None."""
+    # Build the candidate list: Linux/NAS paths + Windows user-profile pattern
+    candidates = list(DEFAULT_LOG_PATHS)
+    # Windows paths via SSH: enumerate C:\Users\*\AppData\Local\... using a cmd.exe-compatible check
+    # We try a few common Windows usernames via the static list supplemented below
+    win_glob_cmd = (
+        r'cmd /c "for /D %u in (C:\Users\*) do '
+        r'if exist "%u\AppData\Local\Plex Media Server\Logs\Plex Media Server.log" '
+        r'echo %u\AppData\Local\Plex Media Server\Logs" 2>nul'
+    )
+
+    # 1. Try all known static paths (Unix-style check first)
+    for path in candidates:
+        # Use a shell-agnostic existence test that works on both Unix and Windows SSH servers
+        out = run_ssh(ssh_target,
+                      f'test -f "{path}/Plex Media Server.log" && echo yes 2>/dev/null || echo no')
         if out.strip() == "yes":
             return path
 
-    # 2. Broad search via find — check common roots
+    # 2. Windows SSH server: enumerate user profiles via cmd.exe
+    try:
+        out = run_ssh(ssh_target, win_glob_cmd, timeout=30)
+        hit = out.strip().splitlines()
+        if hit:
+            return hit[0].strip()
+    except (RuntimeError, subprocess.TimeoutExpired):
+        pass
+
+    # 3. Unix broad find fallback
     print("  Known paths not found — searching broadly on remote host ...")
     cmd = (
-        'find /var /opt /home /mnt /volume1 /volume2 /usr /srv / '
-        r'-maxdepth 12 -name "Plex Media Server.log" 2>/dev/null '
-        '| head -1'
+        'find /var /opt /home /mnt /volume1 /volume2 /usr /srv '
+        '-maxdepth 12 -name "Plex Media Server.log" 2>/dev/null | head -1'
     )
     try:
         out = run_ssh(ssh_target, cmd, timeout=90)
         hit = out.strip()
         if hit:
-            # strip the filename to get the directory
             return hit.rsplit("/", 1)[0]
     except (RuntimeError, subprocess.TimeoutExpired):
         pass
